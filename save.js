@@ -57,6 +57,10 @@ for (const form of document.querySelectorAll(".save-file")) {
         for (const line of lines) {
           const update = JSON.parse(line);
           if (update.state === "error") throw new Error(update.message);
+          if (update.state === "stage") {
+            status.textContent = update.message;
+            progress.textContent = "";
+          }
           if (update.state === "progress") {
             progress.textContent = formatSize(update.received) +
               (update.total != null ? " of " + formatSize(Number(update.total)) : " received");
@@ -65,7 +69,8 @@ for (const form of document.querySelectorAll(".save-file")) {
             name.textContent = update.filename;
             status.textContent = "Done in save/";
             progress.textContent = "";
-            button.textContent = "done";
+            button.textContent = "Saved";
+            button.removeAttribute("aria-label");
             copy.hidden = false;
             return;
           }

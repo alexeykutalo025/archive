@@ -1,9 +1,14 @@
 """Archive Index. Run with Python 3.8 or newer."""
+from video import VIDEO_EXTENSIONS, encode_video
+
 import argparse
 import json
 import hashlib
 import os
 import errno
+import sqlite3
+import threading
+from contextlib import closing
 import socket
 import time
 from urllib.error import HTTPError, URLError
@@ -21,8 +26,6 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 ARCHIVE = "https://archive.org"
-TYPES = {"": "All media", "texts": "Texts", "audio": "Audio", "movies": "Video",
-         "software": "Software", "image": "Images", "web": "Web", "data": "Data"}
 SORT = {"": "Relevance", "date desc": "Newest first", "date asc": "Oldest first",
         "downloads desc": "Most downloaded"}
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -80,12 +83,11 @@ def pager(path, params, page, total):
 
 def search(params):
     term = params.get("q", "").strip()
-    media = params.get("media", "")
     sort = params.get("sort", "")
     year = params.get("year", "").strip()
-    controls = f"""<h1>Search the archive<span>.</span></h1>
+    controls = f"""<h1>Search archive videos<span>.</span></h1>
     <form action="/search"><label>Search terms<input type="search" name="q" placeholder="Title, creator, or subject" value="{esc(term)}"></label>
-    <div class="controls">{select("media","Media type",TYPES,media)}
+    <div class="controls">
     <label>Year<input name="year" inputmode="numeric" pattern="[0-9]{{4}}" placeholder="Any year" value="{esc(year)}"></label>
     {select("sort","Sort by",SORT,sort)}<button>Search</button></div></form>"""
     if not params:
@@ -94,20 +96,18 @@ def search(params):
         return layout("Search", controls + '<h2>Browse by topic</h2>' + items)
     if year and not re.fullmatch(r"[0-9]{4}", year):
         return layout("Search", controls + "<p>Enter a four-digit year.</p>")
-    if media not in TYPES or sort not in SORT:
+    if sort not in SORT:
         return layout("Search", controls + "<p>Select a listed filter and search again.</p>")
     # Treat punctuation as text separators, keeping Archive query syntax internal.
     words = re.findall(r"[^\W_]+", term, re.UNICODE)
     if term and not words:
         return layout("Search", controls + "<p>Enter a word or number to search.</p>")
     clauses = ['"' + w + '"' for w in words]
-    clauses.append("mediatype:" + media if media else "NOT mediatype:collection")
+    clauses.append("mediatype:movies")
     if year:
         clauses.append("year:" + year)
-    if clauses[0].startswith("NOT "):
-        clauses.insert(0, "*:*")
     page = page_number(params)
-    args = {"q": " AND ".join(clauses), "fl[]": ["identifier","title","creator","year","mediatype"],
+    args = {"q": " AND ".join(clauses), "fl[]": ["identifier","title","creator","year"],
             "rows": LIMIT, "page": page, "output": "json"}
     if sort:
         args["sort[]"] = sort
@@ -119,7 +119,7 @@ def search(params):
         creator = doc.get("creator") or ""
         if isinstance(creator, list):
             creator = ", ".join(map(str, creator))
-        meta = " · ".join(esc(v) for v in [TYPES.get(doc.get("mediatype"),doc.get("mediatype")),doc.get("year"),creator] if v)
+        meta = " · ".join(esc(v) for v in ["Video",doc.get("year"),creator] if v)
         rows.append(f'<article><a href="{link("/files", id=identifier)}">{esc(doc.get("title") or identifier)}</a><small>{meta}</small></article>')
     body = "".join(rows) or "<p>No items on this page. Try fewer terms or a broader filter.</p>"
     return layout("Search", controls + f"<h2>{total:,} results</h2>" + body + pager("/search", params, page, total))
@@ -134,6 +134,33 @@ def file_size(raw):
         if n < 1000 or unit == "GB":
             return f"{n:,.0f} B" if unit == "B" else f"{n:,.1f} {unit}"
         n /= 1000
+
+
+def save_index():
+    SAVE_DIR.mkdir(mode=0o700, exist_ok=True)
+    db = sqlite3.connect(str(SAVE_DIR / "saved.sqlite3"))
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS saved_files (
+            item TEXT NOT NULL, filename TEXT NOT NULL, zip_name TEXT UNIQUE NOT NULL,
+            PRIMARY KEY (item, filename))""")
+    except Exception:
+        db.close()
+        raise
+    return db
+
+
+def reserve_zip_name(identifier, filename):
+    # Persist the destination before downloading. Its atomic publication marks completion.
+    with closing(save_index()) as db, db:
+        db.execute("""INSERT INTO saved_files VALUES (?, ?, ?)
+                      ON CONFLICT(item, filename) DO NOTHING""",
+                   (identifier, filename, f"archive-{secrets.token_hex(12)}.zip"))
+        return db.execute("SELECT zip_name FROM saved_files WHERE item=? AND filename=?",
+                          (identifier, filename)).fetchone()[0]
+
+
+active_saves = set()
+active_lock = threading.Lock()
 
 
 def files(params):
@@ -158,19 +185,26 @@ def files(params):
     <h2>{len(matches):,} {'file' if len(matches) == 1 else 'files'}</h2>"""
     if matches:
         body += "<p>Encrypted ZIPs are saved in the project’s <code>save/</code> folder.</p>"
+    saved_files = {}
+    if (SAVE_DIR / "saved.sqlite3").is_file():
+        with closing(save_index()) as db:
+            saved_files = dict(db.execute("SELECT filename, zip_name FROM saved_files WHERE item=?", (ident,)))
     for f in matches[start:start + LIMIT]:
         filename = f["name"]
         if any(part in (".","..") for part in filename.split("/")):
             continue
+        saved = saved_files.get(filename)
+        if saved and not (SAVE_DIR / saved).is_file():
+            saved = None
         detail = " · ".join(esc(x) for x in [f.get("format"),file_size(f.get("size"))] if x)
         body += f"""<article class="file"><div>{esc(filename)}<small>{detail}</small></div>
         <form method="post" action="/save" class="save-file">
         <input type="hidden" name="token" value="{FORM_TOKEN}">
         <input type="hidden" name="id" value="{esc(ident)}">
         <input type="hidden" name="name" value="{esc(filename)}">
-        <button aria-label="Save {esc(filename)} to server">Click</button>
+        <button {'disabled' if saved else ''} aria-label="{'Saved' if saved else 'Save'} {esc(filename)}">{'Saved' if saved else 'Click'}</button>
         <small class="status" role="status"></small><small class="progress"></small>
-        <code class="saved-name"></code><button type="button" class="copy" hidden>Copy filename</button>
+        <code class="saved-name">{esc(saved or "")}</code><button type="button" class="copy" {'' if saved else 'hidden'}>Copy filename</button>
         </form></article>"""
     if not matches:
         body += "<p>No matching files. Change the filters or check the item on archive.org.</p>"
@@ -190,6 +224,26 @@ class Handler(BaseHTTPRequestHandler):
                 or any(part in ("", ".", "..") for part in parts)
                 or chr(92) in filename or any(ord(c) < 32 for c in filename)):
             raise ValueError("Invalid file selection")
+        saved_name = reserve_zip_name(identifier, filename)
+        if not (SAVE_DIR / saved_name).is_file():
+            with active_lock:
+                if saved_name in active_saves:
+                    raise ValueError("This file is already being saved. Refresh the file list when it finishes.")
+                active_saves.add(saved_name)
+            try:
+                if not (SAVE_DIR / saved_name).is_file():
+                    self.download_zip(identifier, filename, parts, saved_name, streaming)
+            finally:
+                with active_lock:
+                    active_saves.remove(saved_name)
+        if streaming:
+            self.event(state="saved", filename=saved_name)
+            return
+        self.send_response(303)
+        self.send_header("Location", "/saved?" + urlencode({"file": saved_name, "id": identifier}))
+        self.end_headers()
+
+    def download_zip(self, identifier, filename, parts, saved_name, streaming):
         item = api("/metadata/" + identifier)
         entry = next((f for f in item.get("files", []) if f.get("name") == filename
                       and str(f.get("private", "")).lower() not in ("true", "1")), None)
@@ -198,43 +252,50 @@ class Handler(BaseHTTPRequestHandler):
         member = re.sub(r'[:<>"|?*]', "_", parts[-1])
         request = Request(f"{ARCHIVE}/download/{identifier}/{quote(filename)}",
                           headers={"User-Agent": "ArchiveIndex/1.0"})
-        SAVE_DIR.mkdir(mode=0o700, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=SAVE_DIR, prefix=".saving-", suffix=".part") as output:
-            with urlopen(request, timeout=45) as source, pyzipper.AESZipFile(
-                output, "w", compression=pyzipper.ZIP_DEFLATED
-            ) as archive:
+        def report(message):
+            if streaming:
+                self.event(state="stage", message=message)
+
+        with tempfile.TemporaryDirectory(dir=SAVE_DIR, prefix=".saving-") as temp:
+            folder = Path(temp)
+            media = folder / "source"
+            with urlopen(request, timeout=45) as source, media.open("wb") as target:
+                total = entry.get("size") or source.headers.get("Content-Length")
+                content_type = source.headers.get("Content-Type", "").lower()
+                size = 0
+                digest = hashlib.sha1()
+                last_update = 0.0
+                for chunk in iter(lambda: source.read(256 * 1024), b""):
+                    target.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                    now = time.monotonic()
+                    if streaming and now - last_update >= 0.4:
+                        self.event(state="progress", received=size, total=total)
+                        last_update = now
+            if total is not None and size != int(total):
+                raise ValueError("Incomplete archive.org file")
+            if entry.get("sha1") and digest.hexdigest() != entry["sha1"].lower():
+                raise ValueError("Archive.org file checksum mismatch")
+
+            compression = pyzipper.ZIP_DEFLATED
+            if Path(member).suffix.lower() in VIDEO_EXTENSIONS or content_type.startswith("video/"):
+                media = encode_video(folder, report)
+                member = Path(member).stem + ".mp4"
+                compression = pyzipper.ZIP_STORED
+            report("Writing encrypted ZIP…")
+            packed = folder / "archive.zip"
+            with pyzipper.AESZipFile(packed, "w", compression=compression) as archive:
                 archive.setpassword(ZIP_PASSWORD)
                 archive.setencryption(pyzipper.WZ_AES, nbits=256)
-                digest = hashlib.sha1()
-                size = 0
-                last_update = 0.0
-                total = entry.get("size") or source.headers.get("Content-Length")
-                # The ZIP directory is public. Put the original directory entry
-                # inside the encrypted payload along with the file data.
                 with archive.open("contents.zip", "w", force_zip64=True) as payload, \
-                        zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_STORED) as inner, \
-                        inner.open(member, "w", force_zip64=True) as target:
-                    for chunk in iter(lambda: source.read(256 * 1024), b""):
-                        target.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                        now = time.monotonic()
-                        if streaming and now - last_update >= 0.4:
-                            self.event(state="progress", received=size, total=total)
-                            last_update = now
-                if entry.get("size") is not None and size != int(entry["size"]):
-                    raise ValueError("Incomplete archive.org file")
-                if entry.get("sha1") and digest.hexdigest() != entry["sha1"].lower():
-                    raise ValueError("Archive.org file checksum mismatch")
-            output.flush()
-            saved_name = f"archive-{secrets.token_hex(12)}.zip"
-            os.link(output.name, SAVE_DIR / saved_name)
-        if streaming:
-            self.event(state="saved", filename=saved_name)
-            return
-        self.send_response(303)
-        self.send_header("Location", "/saved?" + urlencode({"file": saved_name, "id": identifier}))
-        self.end_headers()
+                        zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_STORED) as inner:
+                    inner.write(media, member)
+            try:
+                os.link(packed, SAVE_DIR / saved_name)
+            except FileExistsError:
+                if not (SAVE_DIR / saved_name).is_file():
+                    raise
 
     def do_POST(self):
         if self.path != "/save":
@@ -262,7 +323,7 @@ class Handler(BaseHTTPRequestHandler):
             self.save_zip(params, streaming)
         except (BrokenPipeError, ConnectionResetError):
             return
-        except (OSError, HTTPException, ValueError, KeyError) as err:
+        except (sqlite3.Error, OSError, HTTPException, ValueError, KeyError) as err:
             self.log_error("Save failed: %s", err)
             cause = err.reason if isinstance(err, URLError) else err
             if isinstance(err, HTTPError):
@@ -306,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
                 mime = "text/css"
             else:
                 status, body = 404, layout("Missing page","<h1>Page not found</h1><a href='/'>Return to search</a>")
-        except (OSError, ValueError, KeyError) as err:
+        except (sqlite3.Error, OSError, ValueError, KeyError) as err:
             self.log_error("Archive lookup failed: %s", err)
             status, body = 502, layout("Archive unavailable","<h1>Archive request failed</h1><p>Refresh to retry, or return to search.</p><a href='/'>Return to search</a>")
         data = body.encode("utf8")
