@@ -85,7 +85,7 @@ def search(params):
     term = params.get("q", "").strip()
     sort = params.get("sort", "")
     year = params.get("year", "").strip()
-    controls = f"""<h1>Search archive videos<span>.</span></h1>
+    controls = f"""<h1>Search archive<span>.</span></h1>
     <form action="/search"><label>Search terms<input type="search" name="q" placeholder="Title, creator, or subject" value="{esc(term)}"></label>
     <div class="controls">
     <label>Year<input name="year" inputmode="numeric" pattern="[0-9]{{4}}" placeholder="Any year" value="{esc(year)}"></label>
@@ -120,7 +120,7 @@ def search(params):
         if isinstance(creator, list):
             creator = ", ".join(map(str, creator))
         meta = " · ".join(esc(v) for v in ["Video",doc.get("year"),creator] if v)
-        rows.append(f'<article><a href="{link("/files", id=identifier)}">{esc(doc.get("title") or identifier)}</a><small>{meta}</small></article>')
+        rows.append(f'<article><a href="{link("/files", id=identifier)}">{esc(doc.get("title") or identifier)}</a></article>')
     body = "".join(rows) or "<p>No items on this page. Try fewer terms or a broader filter.</p>"
     return layout("Search", controls + f"<h2>{total:,} results</h2>" + body + pager("/search", params, page, total))
 
