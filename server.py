@@ -136,26 +136,31 @@ def file_size(raw):
         n /= 1000
 
 
+SAVE_TABLES = {"standard": "saved_files", "original": "saved_originals"}
+
+
 def save_index():
     SAVE_DIR.mkdir(mode=0o700, exist_ok=True)
     db = sqlite3.connect(str(SAVE_DIR / "saved.sqlite3"))
     try:
-        db.execute("""CREATE TABLE IF NOT EXISTS saved_files (
-            item TEXT NOT NULL, filename TEXT NOT NULL, zip_name TEXT UNIQUE NOT NULL,
-            PRIMARY KEY (item, filename))""")
+        for table in SAVE_TABLES.values():
+            db.execute(f"""CREATE TABLE IF NOT EXISTS {table} (
+                item TEXT NOT NULL, filename TEXT NOT NULL, zip_name TEXT UNIQUE NOT NULL,
+                PRIMARY KEY (item, filename))""")
     except Exception:
         db.close()
         raise
     return db
 
 
-def reserve_zip_name(identifier, filename):
+def reserve_zip_name(identifier, filename, mode):
+    table = SAVE_TABLES[mode]
     # Persist the destination before downloading. Its atomic publication marks completion.
     with closing(save_index()) as db, db:
-        db.execute("""INSERT INTO saved_files VALUES (?, ?, ?)
+        db.execute(f"""INSERT INTO {table} VALUES (?, ?, ?)
                       ON CONFLICT(item, filename) DO NOTHING""",
                    (identifier, filename, f"archive-{secrets.token_hex(12)}.zip"))
-        return db.execute("SELECT zip_name FROM saved_files WHERE item=? AND filename=?",
+        return db.execute(f"SELECT zip_name FROM {table} WHERE item=? AND filename=?",
                           (identifier, filename)).fetchone()[0]
 
 
@@ -188,24 +193,31 @@ def files(params):
     saved_files = {}
     if (SAVE_DIR / "saved.sqlite3").is_file():
         with closing(save_index()) as db:
-            saved_files = dict(db.execute("SELECT filename, zip_name FROM saved_files WHERE item=?", (ident,)))
+            for mode, table in SAVE_TABLES.items():
+                for filename, zip_name in db.execute(f"SELECT filename, zip_name FROM {table} WHERE item=?", (ident,)):
+                    saved_files[filename, mode] = zip_name
     for f in matches[start:start + LIMIT]:
         filename = f["name"]
         if any(part in (".","..") for part in filename.split("/")):
             continue
-        saved = saved_files.get(filename)
-        if saved and not (SAVE_DIR / saved).is_file():
-            saved = None
         detail = " · ".join(esc(x) for x in [f.get("format"),file_size(f.get("size"))] if x)
-        body += f"""<article class="file"><div>{esc(filename)}<small>{detail}</small></div>
+        body += f"""<article class="file"><div>{esc(filename)}<small>{detail}</small></div><section class="save-options">"""
+        for mode, label in (("standard", "Click"), ("original", "Here")):
+            saved = saved_files.get((filename, mode))
+            if saved and not (SAVE_DIR / saved).is_file():
+                saved = None
+            description = "Save original file" if mode == "original" else "Save file (encode videos)"
+            body += f"""
         <form method="post" action="/save" class="save-file">
+        <input type="hidden" name="mode" value="{mode}">
         <input type="hidden" name="token" value="{FORM_TOKEN}">
         <input type="hidden" name="id" value="{esc(ident)}">
         <input type="hidden" name="name" value="{esc(filename)}">
-        <button {'disabled' if saved else ''} aria-label="{'Saved' if saved else 'Save'} {esc(filename)}">{'Saved' if saved else 'Click'}</button>
+        <button {'disabled' if saved else ''} title="{description}" aria-label="{label} — {description} {esc(filename)}">{'Saved' if saved else label}</button>
         <small class="status" role="status"></small><small class="progress"></small>
         <code class="saved-name">{esc(saved or "")}</code><button type="button" class="copy" {'' if saved else 'hidden'}>Copy filename</button>
-        </form></article>"""
+        </form>"""
+        body += "</section></article>"
     if not matches:
         body += "<p>No matching files. Change the filters or check the item on archive.org.</p>"
     return layout(title, body + pager("/files", params, page, len(matches)) + '<script src="/save.js" defer></script>')
@@ -224,7 +236,10 @@ class Handler(BaseHTTPRequestHandler):
                 or any(part in ("", ".", "..") for part in parts)
                 or chr(92) in filename or any(ord(c) < 32 for c in filename)):
             raise ValueError("Invalid file selection")
-        saved_name = reserve_zip_name(identifier, filename)
+        mode = params.get("mode", "standard")
+        if mode not in SAVE_TABLES:
+            raise ValueError("Invalid save option")
+        saved_name = reserve_zip_name(identifier, filename, mode)
         if not (SAVE_DIR / saved_name).is_file():
             with active_lock:
                 if saved_name in active_saves:
@@ -232,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                 active_saves.add(saved_name)
             try:
                 if not (SAVE_DIR / saved_name).is_file():
-                    self.download_zip(identifier, filename, parts, saved_name, streaming)
+                    self.download_zip(identifier, filename, parts, saved_name, streaming, mode)
             finally:
                 with active_lock:
                     active_saves.remove(saved_name)
@@ -243,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/saved?" + urlencode({"file": saved_name, "id": identifier}))
         self.end_headers()
 
-    def download_zip(self, identifier, filename, parts, saved_name, streaming):
+    def download_zip(self, identifier, filename, parts, saved_name, streaming, mode):
         item = api("/metadata/" + identifier)
         entry = next((f for f in item.get("files", []) if f.get("name") == filename
                       and str(f.get("private", "")).lower() not in ("true", "1")), None)
@@ -278,8 +293,8 @@ class Handler(BaseHTTPRequestHandler):
             if entry.get("sha1") and digest.hexdigest() != entry["sha1"].lower():
                 raise ValueError("Archive.org file checksum mismatch")
 
-            compression = pyzipper.ZIP_DEFLATED
-            if Path(member).suffix.lower() in VIDEO_EXTENSIONS or content_type.startswith("video/"):
+            compression = pyzipper.ZIP_STORED if mode == "original" else pyzipper.ZIP_DEFLATED
+            if mode == "standard" and (Path(member).suffix.lower() in VIDEO_EXTENSIONS or content_type.startswith("video/")):
                 media = encode_video(folder, report)
                 member = Path(member).stem + ".mp4"
                 compression = pyzipper.ZIP_STORED
