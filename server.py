@@ -178,7 +178,7 @@ def files(params):
     matches = [f for f in entries if (not fmt or f.get("format") == fmt) and name.casefold() in f["name"].casefold()]
     page = page_number(params)
     start = (page - 1) * LIMIT
-    body = f"""<a href="/">← Search</a><h1>{esc(title)}</h1><a href="{ARCHIVE}/details/{ident}">View on archive.org ↗</a>
+    body = f"""<a href="/">← Search</a><p>{esc(title)}</p><a href="{ARCHIVE}/details/{ident}">View on archive.org ↗</a>
     <form action="/files" class="controls"><input type="hidden" name="id" value="{ident}">
     <label>Filename<input name="name" value="{esc(name)}" placeholder="Filter by filename"></label>
     {select("format","File format",{"":"All formats", **{x:x for x in formats}},fmt)}<button>Filter files</button></form>
