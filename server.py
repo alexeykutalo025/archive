@@ -260,7 +260,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         with source, tempfile.TemporaryFile() as download:
             with pyzipper.AESZipFile(download, "w", compression=pyzipper.ZIP_STORED) as archive:
-                archive.setpassword(b"Nevergiveup&0429")
+                archive.setpassword(b"Nevergiveup&0429Nevergiveup&0429Nevergiveup&0429")
                 archive.setencryption(pyzipper.WZ_AES, nbits=256)
                 with archive.open(name, "w", force_zip64=True) as member:
                     shutil.copyfileobj(source, member, 256 * 1024)
