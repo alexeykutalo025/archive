@@ -6,7 +6,6 @@ import json
 import hashlib
 import os
 import errno
-import shutil
 import sqlite3
 import threading
 from contextlib import closing
@@ -294,53 +293,103 @@ def downloads_page():
                          key=lambda p: p.stat().st_mtime_ns, reverse=True)
     links = "".join(
         f'<li><a class="topic" href="/download/{quote(folder.name, safe="")}" download>'
-        f'{esc(folder.name)}</a></li>' for folder in folders
+        f'{esc(folder.name)}</a><span class="download-progress" hidden>'
+        f'<progress aria-label="Download progress for {esc(folder.name)}" max="100" value="0"></progress>'
+        f'<span aria-hidden="true">0%</span></span></li>'  for folder in folders
     )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Saved folders</title><link rel="stylesheet" href="/style.css"></head>
-    <body><main><ul class="folders" aria-label="Folder downloads">{links}</ul></main></body></html>"""
+    <body><main><ul class="folders" aria-label="Folder downloads">{links}</ul></main><script src="/downloads.js" defer></script></body></html>"""
 
 
-def pack_folder(folder, inner):
+# Keep only active downloads and briefly retain their final status for polling.
+download_states = {}
+download_lock = threading.Lock()
+
+
+def download_state(token, value=None):
+    now = time.monotonic()
+    with download_lock:
+        expired = [key for key, (_, until) in download_states.items() if until <= now]
+        for key in expired:
+            del download_states[key]
+        if value is not None:
+            download_states[token] = (value, now + 300)
+        return download_states.get(token, (None, 0))[0]
+
+
+def pack_folder(folder, inner, report):
     def fail(error):
         raise error
 
+    entries = []
+    total = 0
     for root, dirs, files in os.walk(folder, onerror=fail):
         path = Path(root)
         dirs[:] = sorted(d for d in dirs if plain_entry(path / d, stat.S_ISDIR))
-        inner.writestr(path.relative_to(SAVE_DIR).as_posix() + "/", b"")
+        entries.append((path, True))
         for name in sorted(files):
             child = path / name
             if plain_entry(child, stat.S_ISREG):
-                inner.write(child, child.relative_to(SAVE_DIR).as_posix())
+                entries.append((child, False))
+                total += child.stat().st_size
+
+    written = 0
+    for path, directory in entries:
+        name = path.relative_to(SAVE_DIR).as_posix()
+        if directory:
+            inner.writestr(name + "/", b"")
+        elif plain_entry(path, stat.S_ISREG):
+            info = zipfile.ZipInfo.from_file(path, name)
+            with path.open("rb") as source, inner.open(info, "w", force_zip64=True) as target:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    target.write(chunk)
+                    written += len(chunk)
+                    report(min(49, written * 50 // max(1, total)))
 
 
 class Handler(BaseHTTPRequestHandler):
-    def download_saved(self, name):
-        name = unquote(name)
-        if not public_folder(name):
-            self.send_error(404)
-            return
-        with tempfile.TemporaryFile() as download:
-            with pyzipper.AESZipFile(download, "w", compression=pyzipper.ZIP_STORED) as archive:
-                archive.setpassword(ZIP_PASSWORD)
-                archive.setencryption(pyzipper.WZ_AES, nbits=256)
-                with archive.open("contents.zip", "w", force_zip64=True) as member:
-                    with zipfile.ZipFile(member, "w") as inner:
-                        pack_folder(SAVE_DIR / name, inner)
-            length = download.tell()
-            download.seek(0)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", "attachment; filename=\"folder-download.zip\"; filename*=UTF-8''" + quote(name + "-download.zip", safe=""))
-            self.send_header("Content-Length", str(length))
-            self.end_headers()
-            try:
-                shutil.copyfileobj(download, self.wfile, 256 * 1024)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+    def download_saved(self, name, token):
+        tracked = bool(re.fullmatch(r"[0-9a-f]{32}", token))
+        last = None
 
+        def report(value):
+            nonlocal last
+            if tracked and last != value:
+                download_state(token, value)
+                last = value
+
+        report(0)
+        try:
+            name = unquote(name)
+            if not public_folder(name):
+                self.send_error(404)
+                return
+            with tempfile.TemporaryFile() as download:
+                with pyzipper.AESZipFile(download, "w", compression=pyzipper.ZIP_STORED) as archive:
+                    archive.setpassword(ZIP_PASSWORD)
+                    archive.setencryption(pyzipper.WZ_AES, nbits=256)
+                    with archive.open("contents.zip", "w", force_zip64=True) as member:
+                        with zipfile.ZipFile(member, "w") as inner:
+                            pack_folder(SAVE_DIR / name, inner, report)
+                report(50)
+                length = download.tell()
+                download.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", "attachment; filename=\"folder-download.zip\"; filename*=UTF-8''" + quote(name + "-download.zip", safe=""))
+                self.send_header("Content-Length", str(length))
+                self.end_headers()
+                for chunk in iter(lambda: download.read(256 * 1024), b""):
+                    self.wfile.write(chunk)
+                    report(min(99, 50 + download.tell() * 50 // length))
+                report(100)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if last != 100:
+                report(-1)
 
     def event(self, **data):
         self.wfile.write((json.dumps(data) + "\n").encode())
@@ -497,7 +546,10 @@ class Handler(BaseHTTPRequestHandler):
             if path.path == "/":
                 body = downloads_page()
             elif path.path.startswith("/download/"):
-                return self.download_saved(path.path[len("/download/"):])
+                return self.download_saved(path.path[len("/download/"):], params.get("progress", ""))
+            elif path.path == "/download-progress":
+                body = json.dumps(download_state(params.get("progress", "")))
+                mime = "application/json"
             elif path.path in ("/home", "/search"):
                 body = search(params)
             elif path.path == "/saved":
@@ -510,8 +562,8 @@ class Handler(BaseHTTPRequestHandler):
                     status, body = 404, layout("Missing file", "<h1>Saved ZIP unavailable</h1>")
             elif path.path == "/files":
                 body = files(params)
-            elif path.path == "/save.js":
-                body = (PROJECT_ROOT / "save.js").read_text(encoding="utf8")
+            elif path.path in ("/save.js", "/downloads.js"):
+                body = (PROJECT_ROOT / path.path[1:]).read_text(encoding="utf8")
                 mime = "text/javascript"
             elif path.path == "/style.css":
                 body = Path(__file__).with_name("style.css").read_text(encoding="utf8")
@@ -523,6 +575,8 @@ class Handler(BaseHTTPRequestHandler):
             status, body = 502, layout("Archive unavailable","<h1>Archive request failed</h1><p>Refresh to retry, or return to search.</p><a href='/home'>Return to search</a>")
         data = body.encode("utf8")
         self.send_response(status)
+        if path.path == "/download-progress":
+            self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Type", mime + "; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()

@@ -4,3 +4,10 @@ form.save-file{background:none;border:0;padding:0}.save-file button{white-space:
 form.save-file{min-width:0;text-align:right}.save-file button:disabled{opacity:.7;cursor:default}.save-file code:not(:empty){display:block;font-size:.82rem;margin:5px 0}.save-file .copy{background:transparent;color:var(--accent);padding:4px 8px;font-size:.82rem}.file>div{flex:1}.save-options{display:flex;align-items:flex-start;gap:.5rem;max-width:58%}.save-options .save-file{min-width:0}.save-options button{max-width:100%}@media(max-width:640px){.file{flex-wrap:wrap}.save-options{max-width:100%}.file>div{flex-basis:100%}}
 
 .folders{margin:0;padding:0;list-style:none;overflow-wrap:anywhere}
+
+.folders li{display:flex;align-items:center;gap:.75rem;border-bottom:1px solid var(--line)}
+.folders .topic{border:0;min-width:0}
+.download-progress{display:inline-flex;align-items:center;gap:.5rem;flex:none;color:var(--accent);font-size:.82rem;font-variant-numeric:tabular-nums}
+.download-progress[hidden]{display:none}
+.download-progress progress{width:clamp(3rem,12vw,7rem);height:.45rem;accent-color:var(--accent)}
+.download-progress span{min-width:4ch;text-align:right}
