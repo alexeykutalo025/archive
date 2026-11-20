@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import threading
 from contextlib import closing
+import stat
 import socket
 import time
 from urllib.error import HTTPError, URLError
@@ -22,8 +23,8 @@ import pyzipper
 import re
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from pathlib import Path, PureWindowsPath
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 ARCHIVE = "https://archive.org"
@@ -206,7 +207,7 @@ def files(params):
         body += f"""<article class="file"><div>{esc(filename)}<small>{detail}</small></div><section class="save-options">"""
         for mode, label in (("standard", "Click"), ("original", "Here")):
             saved = saved_files.get((filename, mode))
-            if saved and not (SAVE_DIR / saved).is_file():
+            if saved and not saved_exists(item_folder(ident), saved):
                 saved = None
             description = "Save original file" if mode == "original" else "Save file (encode videos)"
             body += f"""
@@ -228,47 +229,111 @@ def files(params):
 ARCHIVE_NAME = re.compile(r"archive-[0-9a-f]{24}\.zip")
 
 
-def downloads_page():
-    rows = []
-    if SAVE_DIR.is_dir():
-        for path in SAVE_DIR.iterdir():
-            if ARCHIVE_NAME.fullmatch(path.name) and not path.is_symlink() and path.is_file():
-                try:
-                    info = path.stat()
-                except FileNotFoundError:
+def plain_entry(path, kind):
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return kind(info.st_mode) and not (getattr(info, "st_file_attributes", 0) &
+                                        stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def item_folder(identifier):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", identifier):
+        raise ValueError("Invalid item identifier")
+    name = identifier
+    if (PureWindowsPath(name).is_reserved() or name.endswith(".") or len(name) > 200
+            or name.lower().startswith("saved.sqlite3")):
+        name = "item~" + hashlib.sha256(identifier.encode()).hexdigest()
+    return SAVE_DIR / name
+
+
+def saved_exists(folder, name):
+    return (ARCHIVE_NAME.fullmatch(name) and plain_entry(folder, stat.S_ISDIR)
+            and plain_entry(folder / name, stat.S_ISREG))
+
+
+def ensure_folder(folder):
+    folder.mkdir(mode=0o700, exist_ok=True)
+    if not plain_entry(folder, stat.S_ISDIR):
+        raise ValueError("Save destination must be a regular directory")
+
+
+def migrate_saved_files():
+    if not (SAVE_DIR / "saved.sqlite3").is_file():
+        return
+    with closing(save_index()) as db:
+        for table in SAVE_TABLES.values():
+            for item, name in db.execute(f"SELECT item, zip_name FROM {table}"):
+                source = SAVE_DIR / name
+                if not ARCHIVE_NAME.fullmatch(name) or not plain_entry(source, stat.S_ISREG):
                     continue
-                rows.append((info.st_mtime_ns, path.name, file_size(info.st_size)))
-    body = "<h1>Saved files</h1>"
-    if not rows:
-        body += '<p>No saved ZIPs yet. <a href="/home">Search the archive</a> to save a file.</p>'
-    for _, name, size in sorted(rows, reverse=True):
-        body += (f'<article class="file"><div>{name}<small>{size}</small></div>'
-                 f'<a href="/download/{name}" download>Download</a></article>')
-    return layout("Saved files", body)
+                folder = item_folder(item)
+                ensure_folder(folder)
+                destination = folder / name
+                try:
+                    os.link(source, destination)
+                except FileExistsError:
+                    if not plain_entry(destination, stat.S_ISREG) or not source.samefile(destination):
+                        print(f"Migration conflict: kept both copies of {name}", flush=True)
+                        continue
+                source.unlink()
+
+
+def public_folder(name):
+    if (not name or name.startswith(".") or "/" in name or chr(92) in name
+            or ":" in name or any(ord(c) < 32 for c in name)):
+        return False
+    return plain_entry(SAVE_DIR / name, stat.S_ISDIR)
+
+
+def downloads_page():
+    folders = []
+    if SAVE_DIR.is_dir():
+        folders = sorted((p for p in SAVE_DIR.iterdir() if public_folder(p.name)),
+                         key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    links = "".join(
+        f'<li><a class="topic" href="/download/{quote(folder.name, safe="")}" download>'
+        f'{esc(folder.name)}</a></li>' for folder in folders
+    )
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Saved folders</title><link rel="stylesheet" href="/style.css"></head>
+    <body><main><ul class="folders" aria-label="Folder downloads">{links}</ul></main></body></html>"""
+
+
+def pack_folder(folder, inner):
+    def fail(error):
+        raise error
+
+    for root, dirs, files in os.walk(folder, onerror=fail):
+        path = Path(root)
+        dirs[:] = sorted(d for d in dirs if plain_entry(path / d, stat.S_ISDIR))
+        inner.writestr(path.relative_to(SAVE_DIR).as_posix() + "/", b"")
+        for name in sorted(files):
+            child = path / name
+            if plain_entry(child, stat.S_ISREG):
+                inner.write(child, child.relative_to(SAVE_DIR).as_posix())
 
 
 class Handler(BaseHTTPRequestHandler):
     def download_saved(self, name):
-        path = SAVE_DIR / name
-        if not ARCHIVE_NAME.fullmatch(name) or path.is_symlink() or not path.is_file():
+        name = unquote(name)
+        if not public_folder(name):
             self.send_error(404)
             return
-        try:
-            source = path.open("rb")
-        except FileNotFoundError:
-            self.send_error(404)
-            return
-        with source, tempfile.TemporaryFile() as download:
+        with tempfile.TemporaryFile() as download:
             with pyzipper.AESZipFile(download, "w", compression=pyzipper.ZIP_STORED) as archive:
-                archive.setpassword(b"Nevergiveup&0429Nevergiveup&0429Nevergiveup&0429")
+                archive.setpassword(ZIP_PASSWORD)
                 archive.setencryption(pyzipper.WZ_AES, nbits=256)
-                with archive.open(name, "w", force_zip64=True) as member:
-                    shutil.copyfileobj(source, member, 256 * 1024)
+                with archive.open("contents.zip", "w", force_zip64=True) as member:
+                    with zipfile.ZipFile(member, "w") as inner:
+                        pack_folder(SAVE_DIR / name, inner)
             length = download.tell()
             download.seek(0)
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", f'attachment; filename="{path.stem}-download.zip"')
+            self.send_header("Content-Disposition", "attachment; filename=\"folder-download.zip\"; filename*=UTF-8''" + quote(name + "-download.zip", safe=""))
             self.send_header("Content-Length", str(length))
             self.end_headers()
             try:
@@ -293,13 +358,13 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in SAVE_TABLES:
             raise ValueError("Invalid save option")
         saved_name = reserve_zip_name(identifier, filename, mode)
-        if not (SAVE_DIR / saved_name).is_file():
+        if not saved_exists(item_folder(identifier), saved_name):
             with active_lock:
                 if saved_name in active_saves:
                     raise ValueError("This file is already being saved. Refresh the file list when it finishes.")
                 active_saves.add(saved_name)
             try:
-                if not (SAVE_DIR / saved_name).is_file():
+                if not saved_exists(item_folder(identifier), saved_name):
                     self.download_zip(identifier, filename, parts, saved_name, streaming, mode)
             finally:
                 with active_lock:
@@ -369,10 +434,12 @@ class Handler(BaseHTTPRequestHandler):
                             if percent > last_percent:
                                 report(f"{stage} {percent}%")
                                 last_percent = percent
+            destination = item_folder(identifier)
+            ensure_folder(destination)
             try:
-                os.link(packed, SAVE_DIR / saved_name)
+                os.link(packed, destination / saved_name)
             except FileExistsError:
-                if not (SAVE_DIR / saved_name).is_file():
+                if not saved_exists(item_folder(identifier), saved_name):
                     raise
             report(f"{stage} 100%")
 
@@ -435,8 +502,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = search(params)
             elif path.path == "/saved":
                 name = params.get("file", "")
-                if re.fullmatch(r"archive-[0-9a-f]{24}\.zip", name) and ((SAVE_DIR / name).is_file() or (PROJECT_ROOT / name).is_file()):
-                    relative_path = "save/" + name if (SAVE_DIR / name).is_file() else name
+                folder = item_folder(params["id"]) if params.get("id") and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", params["id"]) else None
+                if folder and saved_exists(folder, name):
+                    relative_path = "save/" + folder.name + "/" + name
                     body = layout("File saved", f'<h1>File saved</h1><p>Project path: <strong>{relative_path}</strong>.</p><a href="{link("/files", id=params.get("id", ""))}">Return to files</a>')
                 else:
                     status, body = 404, layout("Missing file", "<h1>Saved ZIP unavailable</h1>")
@@ -465,6 +533,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     port = parser.parse_args().port
+    migrate_saved_files()
     with ThreadingHTTPServer(("127.0.0.1", port), Handler) as server:
         print(f"Open http://127.0.0.1:{port} in your browser.", flush=True)
         try:
