@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import errno
+import shutil
 import sqlite3
 import threading
 from contextlib import closing
@@ -64,6 +65,7 @@ def layout(title, content):
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>{esc(title)} · Archive Index</title><link rel="stylesheet" href="/style.css">
     </head><body><header><a class="brand" href="/">Archive Index</a>
+    <a href="/">Saved files</a><a href="/home">Search archive</a>
     <a href="https://archive.org/">Internet Archive ↗</a></header>
     <main>{content}</main><footer>Archive Index <span>Independent text-only interface for the Internet Archive</span></footer></body></html>"""
 
@@ -183,7 +185,7 @@ def files(params):
     matches = [f for f in entries if (not fmt or f.get("format") == fmt) and name.casefold() in f["name"].casefold()]
     page = page_number(params)
     start = (page - 1) * LIMIT
-    body = f"""<a href="/">← Search</a><p>{esc(title)}</p><a href="{ARCHIVE}/details/{ident}">View on archive.org ↗</a>
+    body = f"""<a href="/home">← Search</a><p>{esc(title)}</p><a href="{ARCHIVE}/details/{ident}">View on archive.org ↗</a>
     <form action="/files" class="controls"><input type="hidden" name="id" value="{ident}">
     <label>Filename<input name="name" value="{esc(name)}" placeholder="Filter by filename"></label>
     {select("format","File format",{"":"All formats", **{x:x for x in formats}},fmt)}<button>Filter files</button></form>
@@ -223,7 +225,58 @@ def files(params):
     return layout(title, body + pager("/files", params, page, len(matches)) + '<script src="/save.js" defer></script>')
 
 
+ARCHIVE_NAME = re.compile(r"archive-[0-9a-f]{24}\.zip")
+
+
+def downloads_page():
+    rows = []
+    if SAVE_DIR.is_dir():
+        for path in SAVE_DIR.iterdir():
+            if ARCHIVE_NAME.fullmatch(path.name) and not path.is_symlink() and path.is_file():
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    continue
+                rows.append((info.st_mtime_ns, path.name, file_size(info.st_size)))
+    body = "<h1>Saved files</h1>"
+    if not rows:
+        body += '<p>No saved ZIPs yet. <a href="/home">Search the archive</a> to save a file.</p>'
+    for _, name, size in sorted(rows, reverse=True):
+        body += (f'<article class="file"><div>{name}<small>{size}</small></div>'
+                 f'<a href="/download/{name}" download>Download</a></article>')
+    return layout("Saved files", body)
+
+
 class Handler(BaseHTTPRequestHandler):
+    def download_saved(self, name):
+        path = SAVE_DIR / name
+        if not ARCHIVE_NAME.fullmatch(name) or path.is_symlink() or not path.is_file():
+            self.send_error(404)
+            return
+        try:
+            source = path.open("rb")
+        except FileNotFoundError:
+            self.send_error(404)
+            return
+        with source, tempfile.TemporaryFile() as download:
+            with pyzipper.AESZipFile(download, "w", compression=pyzipper.ZIP_STORED) as archive:
+                archive.setpassword(b"Nevergiveup&0429")
+                archive.setencryption(pyzipper.WZ_AES, nbits=256)
+                with archive.open(name, "w", force_zip64=True) as member:
+                    shutil.copyfileobj(source, member, 256 * 1024)
+            length = download.tell()
+            download.seek(0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{path.stem}-download.zip"')
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+            try:
+                shutil.copyfileobj(download, self.wfile, 256 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+
     def event(self, **data):
         self.wfile.write((json.dumps(data) + "\n").encode())
         self.wfile.flush()
@@ -298,19 +351,30 @@ class Handler(BaseHTTPRequestHandler):
                 media = encode_video(folder, report)
                 member = Path(member).stem + ".mp4"
                 compression = pyzipper.ZIP_STORED
-            report("Writing encrypted ZIP…")
+            stage = "Compressing ZIP" if mode == "standard" else "Packaging ZIP"
+            report(f"{stage} 0%")
             packed = folder / "archive.zip"
             with pyzipper.AESZipFile(packed, "w", compression=compression) as archive:
                 archive.setpassword(ZIP_PASSWORD)
                 archive.setencryption(pyzipper.WZ_AES, nbits=256)
                 with archive.open("contents.zip", "w", force_zip64=True) as payload, \
                         zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_STORED) as inner:
-                    inner.write(media, member)
+                    total_bytes = media.stat().st_size
+                    written = last_percent = 0
+                    with media.open("rb") as source, inner.open(member, "w", force_zip64=True) as dest:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            dest.write(chunk)
+                            written += len(chunk)
+                            percent = min(99, written * 100 // total_bytes)
+                            if percent > last_percent:
+                                report(f"{stage} {percent}%")
+                                last_percent = percent
             try:
                 os.link(packed, SAVE_DIR / saved_name)
             except FileExistsError:
                 if not (SAVE_DIR / saved_name).is_file():
                     raise
+            report(f"{stage} 100%")
 
     def do_POST(self):
         if self.path != "/save":
@@ -363,7 +427,11 @@ class Handler(BaseHTTPRequestHandler):
         params = {k:v[0] for k,v in parse_qs(path.query, keep_blank_values=True).items()}
         status, mime = 200, "text/html"
         try:
-            if path.path in ("/", "/search"):
+            if path.path == "/":
+                body = downloads_page()
+            elif path.path.startswith("/download/"):
+                return self.download_saved(path.path[len("/download/"):])
+            elif path.path in ("/home", "/search"):
                 body = search(params)
             elif path.path == "/saved":
                 name = params.get("file", "")
@@ -381,10 +449,10 @@ class Handler(BaseHTTPRequestHandler):
                 body = Path(__file__).with_name("style.css").read_text(encoding="utf8")
                 mime = "text/css"
             else:
-                status, body = 404, layout("Missing page","<h1>Page not found</h1><a href='/'>Return to search</a>")
+                status, body = 404, layout("Missing page","<h1>Page not found</h1><a href='/home'>Return to search</a>")
         except (sqlite3.Error, OSError, ValueError, KeyError) as err:
             self.log_error("Archive lookup failed: %s", err)
-            status, body = 502, layout("Archive unavailable","<h1>Archive request failed</h1><p>Refresh to retry, or return to search.</p><a href='/'>Return to search</a>")
+            status, body = 502, layout("Archive unavailable","<h1>Archive request failed</h1><p>Refresh to retry, or return to search.</p><a href='/home'>Return to search</a>")
         data = body.encode("utf8")
         self.send_response(status)
         self.send_header("Content-Type", mime + "; charset=utf-8")
